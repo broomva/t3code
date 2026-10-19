@@ -70,6 +70,7 @@ import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeComp
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import { mcpAppFromToolItem } from "@t3tools/shared/toolOutput";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { WorkflowAgentTranscriptReadObserver } from "../workflowAgentTranscript.ts";
@@ -2477,6 +2478,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly nativeSessionId?: string;
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
+    readonly mcp?: Pick<
+      ClaudeAdapterV2.ClaudeAgentSdkQuerySession,
+      "mcpServerStatus" | "readMcpResource" | "callMcpTool"
+    >;
   }) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2593,6 +2598,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 stopTask: options?.stopTask ?? (() => Effect.void),
                 interrupt: options?.interrupt ?? Effect.void,
                 close: options?.close?.(sdkMessages) ?? Effect.void,
+                ...options?.mcp,
               };
             }),
           forkSession: () => Effect.die("unused forkSession"),
@@ -2665,6 +2671,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         getOpenedOptions: () => openedOptions,
         terminalEvents,
         hasPendingBackgroundWork,
+        attachmentsDir,
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
@@ -2771,6 +2778,171 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.deepEqual(item.input, { city: "Berlin" });
       }
       assert.equal(new Set(items.map((item) => item.id)).size, 1);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("renders an MCP App for a Claude MCP tool that declares a ui:// resource", () =>
+    Effect.gen(function* () {
+      const reads: Array<{ readonly server: string; readonly uri: string }> = [];
+      const calls: Array<unknown> = [];
+      const resourceUri = "ui://bits-and-bolts/widget";
+      const harness = yield* makeWakeHarnessWithOptions({
+        mcp: {
+          mcpServerStatus: Effect.succeed([
+            {
+              name: "bits-and-bolts",
+              status: "connected",
+              tools: [
+                {
+                  name: "cad.view",
+                  annotations: { readOnly: true },
+                  _meta: { ui: { resourceUri } },
+                },
+                { name: "cad.listParts", _meta: { ui: { visibility: ["app"] } } },
+                { name: "cad.search" },
+              ],
+            },
+          ]),
+          readMcpResource: (server, uri) =>
+            Effect.sync(() => {
+              reads.push({ server, uri });
+              return {
+                contents: [
+                  {
+                    uri,
+                    mimeType: "text/html;profile=mcp-app",
+                    text: "<!doctype html><html><body>parts</body></html>",
+                    _meta: { ui: { prefersBorder: true } },
+                  },
+                ],
+              };
+            }),
+          callMcpTool: (input) =>
+            Effect.sync(() => {
+              calls.push(input);
+              return {
+                content: [{ type: "text", text: "{}" }],
+                structuredContent: { parts: [] },
+              };
+            }),
+        },
+      });
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("mcp-app"),
+          text: "Show me a keycap",
+          attachments: [],
+        }),
+      );
+      const runTool = (id: string, name: string, toolUseResult: unknown) =>
+        Effect.gen(function* () {
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "assistant",
+              uuid: `${id}-assistant`,
+              session_id: WAKE_NATIVE_SESSION,
+              parent_tool_use_id: null,
+              message: {
+                id: `${id}-message`,
+                type: "message",
+                role: "assistant",
+                model: "claude-sonnet-4-6",
+                content: [{ type: "tool_use", id, name, input: { partId: "p1" } }],
+              },
+            }),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "user",
+              uuid: `${id}-result`,
+              session_id: WAKE_NATIVE_SESSION,
+              parent_tool_use_id: null,
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: id, content: "{}" }],
+              },
+              tool_use_result: toolUseResult,
+            }),
+          );
+        });
+      yield* runTool("view-call", "mcp__bits-and-bolts__cad_view", {
+        content: '{"part":"p1"}',
+        structuredContent: { part: { id: "p1" } },
+      });
+      yield* runTool("search-call", "mcp__bits-and-bolts__cad_search", { content: "[]" });
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({ uuid: "mcp-app-terminal", result: "Shown" }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+
+      const settled = (nativeId: string) =>
+        harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.status === "completed" &&
+          event.turnItem.nativeItemRef?.nativeId === nativeId
+            ? [event.turnItem]
+            : [],
+        );
+      const view = settled("view-call").at(-1);
+      assert.isDefined(view);
+      assert.equal(view!.toolName, "bits-and-bolts.cad.view");
+      const app = mcpAppFromToolItem(view!);
+      assert.isDefined(app);
+      assert.equal(app!.server, "bits-and-bolts");
+      assert.equal(app!.tool, "cad.view");
+      assert.equal(app!.resourceUri, resourceUri);
+      assert.isTrue(app!.prefersBorder);
+      assert.deepEqual((view!.output as { readonly result?: unknown }).result, {
+        content: [{ type: "text", text: '{"part":"p1"}' }],
+        structuredContent: { part: { id: "p1" } },
+      });
+      const html = yield* (yield* FileSystem.FileSystem).readFileString(
+        `${harness.attachmentsDir}/${app!.attachmentId}.html`,
+      );
+      assert.include(html, "Content-Security-Policy");
+      assert.include(html, "parts");
+      // A tool without a ui:// resource stays a plain row and is never read.
+      const search = settled("search-call").at(-1);
+      assert.equal(search?.toolName, "mcp__bits-and-bolts__cad_search");
+      assert.isUndefined(mcpAppFromToolItem(search!));
+      assert.deepEqual(reads, [{ server: "bits-and-bolts", uri: resourceUri }]);
+
+      const mcpApps = harness.runtime.mcpApps;
+      assert.isDefined(mcpApps);
+      const tools = yield* mcpApps!.listTools({
+        providerThread: harness.providerThread,
+        server: "bits-and-bolts",
+      });
+      assert.deepEqual(tools.find((tool) => tool.name === "cad.view")?.annotations, {
+        readOnly: true,
+        readOnlyHint: true,
+      });
+      const result = yield* mcpApps!.callTool({
+        providerThread: harness.providerThread,
+        server: "bits-and-bolts",
+        tool: "cad.listParts",
+        arguments: { query: "keycap" },
+      });
+      assert.deepEqual(calls, [
+        { tool: "mcp__bits-and-bolts__cad_listParts", arguments: { query: "keycap" } },
+      ]);
+      assert.deepEqual(result.structuredContent, { parts: [] });
+      const read = yield* mcpApps!.readResource({
+        providerThread: harness.providerThread,
+        server: "bits-and-bolts",
+        uri: resourceUri,
+      });
+      assert.lengthOf(read.contents, 1);
     }).pipe(
       Effect.scoped,
       Effect.provide(
