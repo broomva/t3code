@@ -54,6 +54,7 @@ describe("ClaudeMcpApps", () => {
     });
     assert.deepEqual(tool, {
       name: "cad.importPart",
+      inputSchema: { type: "object" },
       _meta: { ui: { visibility: ["app"] } },
       annotations: {
         readOnly: false,
@@ -62,7 +63,15 @@ describe("ClaudeMcpApps", () => {
         destructiveHint: true,
       },
     });
-    assert.deepEqual(claudeMcpToolForApps({ name: "plain" }), { name: "plain" });
+    assert.deepEqual(claudeMcpToolForApps({ name: "plain" }), {
+      name: "plain",
+      inputSchema: { type: "object" },
+    });
+    const schema = { type: "object", properties: { partId: { type: "string" } } };
+    assert.deepEqual(
+      claudeMcpToolForApps({ name: "cad.view", description: "View", inputSchema: schema }),
+      { name: "cad.view", description: "View", inputSchema: schema },
+    );
   });
 
   it("builds a CallToolResult from either result shape", () => {

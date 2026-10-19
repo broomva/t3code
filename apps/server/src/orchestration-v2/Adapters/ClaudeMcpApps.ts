@@ -34,6 +34,8 @@ export interface ClaudeMcpServerStatusLike {
 
 export interface ClaudeMcpToolStatusLike {
   readonly name: string;
+  readonly description?: unknown;
+  readonly inputSchema?: unknown;
   readonly annotations?: unknown;
   readonly _meta?: unknown;
   readonly ui?: unknown;
@@ -77,13 +79,23 @@ function claudeMcpToolAnnotations(annotations: unknown): Record<string, unknown>
   return out;
 }
 
+/**
+ * The tool as an app reads it in `hostContext.toolInfo`, where MCP requires an
+ * `inputSchema`. The CLI's status omits schemas, so an absent one is the empty
+ * object schema.
+ */
 export function claudeMcpToolForApps(
   tool: ClaudeMcpToolStatusLike,
-): ProviderAdapter.ProviderAdapterV2McpTool {
+): ProviderAdapter.ProviderAdapterV2McpTool & {
+  readonly description?: string;
+  readonly inputSchema: unknown;
+} {
   const meta = claudeMcpToolUiMeta(tool);
   const annotations = claudeMcpToolAnnotations(tool.annotations);
   return {
     name: tool.name,
+    ...(typeof tool.description === "string" ? { description: tool.description } : {}),
+    inputSchema: Predicate.isObject(tool.inputSchema) ? tool.inputSchema : { type: "object" },
     ...(meta === undefined ? {} : { _meta: meta }),
     ...(annotations === undefined ? {} : { annotations }),
   };
