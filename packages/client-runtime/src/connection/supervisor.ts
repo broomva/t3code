@@ -35,6 +35,7 @@ import {
   connectionRouteKind,
   connectionRoutes,
   entryWithRoutes,
+  type ConnectionRouteKind,
   type ReportedEndpoint,
 } from "./routes.ts";
 
@@ -122,6 +123,17 @@ export interface EnvironmentSupervisorOptions {
     readonly activeRoute: ConnectionRoute;
     readonly reported: ReadonlyArray<ReportedEndpoint>;
   }) => Effect.Effect<Option.Option<ConnectionCatalogEntry>>;
+}
+
+// A foreground or network-change probe checks that a socket the OS may have
+// killed silently is still alive. Only a loopback or LAN route answers within
+// the quick budget reliably: a tailnet path that falls back to a DERP relay, a
+// VPN or a public route routinely spikes past 3 seconds, and treating that as
+// a dead socket tears down a working session and forces a full resync.
+function wakeupProbeTimeout(routeKind: ConnectionRouteKind | undefined): Duration.Input {
+  return routeKind === "loopback" || routeKind === "lan"
+    ? QUICK_CONNECTION_PROBE_TIMEOUT
+    : CONNECTION_PROBE_TIMEOUT;
 }
 
 export function retryDelayMs(failureCount: number, random: number): number {
@@ -318,6 +330,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           (route) => connectionRouteId(route.target) === connectionRouteId(lease.prepared.target),
         ),
       ),
+    );
+
+  const leaseRouteKind = (lease: ConnectionDriver.EnvironmentConnectionLease) =>
+    currentRoutes.pipe(
+      Effect.map((routes) => {
+        const route = routes.find(
+          (candidate) =>
+            connectionRouteId(candidate.target) === connectionRouteId(lease.prepared.target),
+        );
+        return route === undefined ? undefined : connectionRouteKind(route);
+      }),
     );
 
   const checkBetterRoutes = Effect.fnUntraced(function* (
@@ -564,7 +587,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     return undefined;
   });
 
-  const probeTimeoutFor = (next: SupervisorSignal): Duration.Input | undefined => {
+  const probeTimeoutFor = (
+    next: SupervisorSignal,
+    routeKind: ConnectionRouteKind | undefined,
+  ): Duration.Input | undefined => {
     switch (next._tag) {
       case "RetryRequested":
         return QUICK_CONNECTION_PROBE_TIMEOUT;
@@ -575,7 +601,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           return CONNECTION_PROBE_TIMEOUT;
         }
         return next.reason === "application-active-probe" || next.reason === "network-changed"
-          ? QUICK_CONNECTION_PROBE_TIMEOUT
+          ? wakeupProbeTimeout(routeKind)
           : undefined;
       case "ConnectRequested":
       case "DisconnectRequested":
@@ -605,6 +631,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       Stream.runForEach(() => requestBetterRouteCheck(lease)),
       Effect.forkScoped,
     );
+    const routeKind = yield* leaseRouteKind(lease);
     for (;;) {
       const next = yield* takeSignal;
       const end = yield* connectedLeaseEnd(next, lease);
@@ -617,7 +644,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       ) {
         yield* requestBetterRouteCheck(lease);
       }
-      const probeTimeout = probeTimeoutFor(next);
+      const probeTimeout = probeTimeoutFor(next, routeKind);
       if (probeTimeout === undefined) {
         continue;
       }
@@ -654,7 +681,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           yield* Fiber.interrupt(probe);
           return endDuringProbe === "reset";
         }
-        const signalTimeout = probeTimeoutFor(probeEvent.signal);
+        const signalTimeout = probeTimeoutFor(probeEvent.signal, routeKind);
         if (signalTimeout !== undefined) {
           const signalDeadline =
             (yield* Clock.monotonicTimeNanos) + Duration.toNanosUnsafe(signalTimeout);

@@ -103,6 +103,25 @@ const LAN_THEN_RELAY_ENTRY: ConnectionCatalogEntry = {
   enabled: true,
 };
 
+const TAILNET_TARGET = new BearerConnectionTarget({
+  environmentId: TARGET.environmentId,
+  label: TARGET.label,
+  connectionId: "bearer:tailnet",
+});
+const TAILNET_ENTRY: ConnectionCatalogEntry = {
+  target: TAILNET_TARGET,
+  profile: Option.some(
+    new BearerConnectionProfile({
+      connectionId: TAILNET_TARGET.connectionId,
+      environmentId: TARGET.environmentId,
+      label: TARGET.label,
+      httpBaseUrl: "http://workstation.tail1234.ts.net:3773/",
+      wsBaseUrl: "ws://workstation.tail1234.ts.net:3773/",
+    }),
+  ),
+  enabled: true,
+};
+
 function preparedFor(target: ConnectionTarget): PreparedConnection {
   return { ...PREPARED_CONNECTION, target };
 }
@@ -1425,14 +1444,16 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("quickly times out a stalled mobile foreground liveness probe", () =>
+  it.effect("quickly times out a stalled mobile foreground liveness probe on a LAN route", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
         probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
+      const supervisor = yield* EnvironmentSupervisor.make(
+        { target: LAN_ROUTE.target, profile: LAN_ROUTE.profile, enabled: true },
+        { initiallyDesired: true },
+      ).pipe(Effect.provide(harness.dependencies));
 
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active-probe");
@@ -1442,6 +1463,54 @@ describe("EnvironmentSupervisor", () => {
         (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
       );
 
+      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("keeps a tailnet session whose foreground probe answers after a relay spike", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        // A DERP-relayed round trip that spikes past the 3 second LAN budget.
+        probe: () => Effect.sleep("3500 millis"),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TAILNET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("3500 millis");
+      yield* harness.wake("network-changed");
+      yield* TestClock.adjust("3500 millis");
+
+      const state = yield* SubscriptionRef.get(supervisor.state);
+      expect(state.phase).toBe("connected");
+      expect(state.generation).toBe(1);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("replaces a tailnet session whose foreground probe stalls past the full budget", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TAILNET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("3 seconds");
+      expect((yield* SubscriptionRef.get(supervisor.state)).generation).toBe(1);
+
+      yield* TestClock.adjust("12 seconds");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
+      );
       expect(yield* Ref.get(harness.sessionCount)).toBe(2);
     }).pipe(Effect.provide(TestClock.layer())),
   );
