@@ -1,8 +1,10 @@
 import { AuthStandardClientScopes, EnvironmentId, type ServerConfig } from "@t3tools/contracts";
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Random from "effect/Random";
@@ -98,6 +100,25 @@ const LAN_THEN_RELAY_ENTRY: ConnectionCatalogEntry = {
   target: LAN_ROUTE.target,
   profile: LAN_ROUTE.profile,
   alternateRoutes: [{ target: RELAY_TARGET, profile: Option.none() }],
+  enabled: true,
+};
+
+const TAILNET_TARGET = new BearerConnectionTarget({
+  environmentId: TARGET.environmentId,
+  label: TARGET.label,
+  connectionId: "bearer:tailnet",
+});
+const TAILNET_ENTRY: ConnectionCatalogEntry = {
+  target: TAILNET_TARGET,
+  profile: Option.some(
+    new BearerConnectionProfile({
+      connectionId: TAILNET_TARGET.connectionId,
+      environmentId: TARGET.environmentId,
+      label: TARGET.label,
+      httpBaseUrl: "http://workstation.tail1234.ts.net:3773/",
+      wsBaseUrl: "ws://workstation.tail1234.ts.net:3773/",
+    }),
+  ),
   enabled: true,
 };
 
@@ -294,7 +315,7 @@ describe("retryDelayMs", () => {
 });
 
 describe("EnvironmentSupervisor", () => {
-  it.effect("exports each relay setup as a standalone linked trace that ends at readiness", () =>
+  it.effect("exports each relay setup as a standalone linked trace with its outcome", () =>
     Effect.gen(function* () {
       const spans: Array<Tracer.NativeSpan> = [];
       const tracer = Tracer.make({
@@ -308,9 +329,10 @@ describe("EnvironmentSupervisor", () => {
           return span;
         },
       });
+      const firstFailure = transient();
       const harness = yield* makeHarness({
-        prepare: (attempt) =>
-          attempt === 1 ? Effect.fail(transient()) : Effect.succeed(PREPARED_CONNECTION),
+        prepare: (attempt, target) =>
+          attempt === 1 ? Effect.fail(firstFailure) : Effect.succeed(preparedFor(target)),
       });
       const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
         initiallyDesired: true,
@@ -334,6 +356,23 @@ describe("EnvironmentSupervisor", () => {
       expect(attempts[0]?.traceId).not.toBe(attempts[1]?.traceId);
       expect(attempts[1]?.links.map((link) => link.span.spanId)).toContain(attempts[0]?.spanId);
       expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+
+      const [failed, connected] = attempts;
+      // The exporter derives the status message from the failure, so it must
+      // be the connection error rather than a wrapper object.
+      const failedExit = failed?.status._tag === "Ended" ? failed.status.exit : undefined;
+      expect(failedExit && Exit.isFailure(failedExit) ? Cause.squash(failedExit.cause) : null).toBe(
+        firstFailure,
+      );
+      expect(Object.fromEntries(failed?.attributes ?? [])).toMatchObject({
+        "connection.outcome": "failed",
+        "connection.failure.tag": "ConnectionTransientError",
+        "connection.failure.reason": "transport",
+      });
+      expect(Object.fromEntries(connected?.attributes ?? [])).toMatchObject({
+        "connection.outcome": "connected",
+        "connection.route": "relay",
+      });
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
@@ -1405,14 +1444,16 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("quickly times out a stalled mobile foreground liveness probe", () =>
+  it.effect("quickly times out a stalled mobile foreground liveness probe on a LAN route", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
         probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
       });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
+      const supervisor = yield* EnvironmentSupervisor.make(
+        { target: LAN_ROUTE.target, profile: LAN_ROUTE.profile, enabled: true },
+        { initiallyDesired: true },
+      ).pipe(Effect.provide(harness.dependencies));
 
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active-probe");
@@ -1422,6 +1463,54 @@ describe("EnvironmentSupervisor", () => {
         (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
       );
 
+      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("keeps a tailnet session whose foreground probe answers after a relay spike", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        // A DERP-relayed round trip that spikes past the 3 second LAN budget.
+        probe: () => Effect.sleep("3500 millis"),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TAILNET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("3500 millis");
+      yield* harness.wake("network-changed");
+      yield* TestClock.adjust("3500 millis");
+
+      const state = yield* SubscriptionRef.get(supervisor.state);
+      expect(state.phase).toBe("connected");
+      expect(state.generation).toBe(1);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("replaces a tailnet session whose foreground probe stalls past the full budget", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TAILNET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("3 seconds");
+      expect((yield* SubscriptionRef.get(supervisor.state)).generation).toBe(1);
+
+      yield* TestClock.adjust("12 seconds");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
+      );
       expect(yield* Ref.get(harness.sessionCount)).toBe(2);
     }).pipe(Effect.provide(TestClock.layer())),
   );
